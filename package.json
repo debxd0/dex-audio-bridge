@@ -1,0 +1,11 @@
+{
+  "name": "dex-audio-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An independently implemented BitChord music source addon by Dex.",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  }
+}
