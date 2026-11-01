@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: dex-audio-bridge
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22
