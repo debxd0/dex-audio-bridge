@@ -3,14 +3,33 @@ import { URL } from "node:url";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const ADDON_ID = "dev.dex.audio-bridge";
 const NAME = "Dex Audio Bridge";
 const TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 9000);
 const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_MINUTE || 90);
-const API_BASES = (process.env.MONOCHROME_API_BASES ||
-  "https://tracks.monochrome.st,https://api.monochrome.tf")
-  .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean);
+
+// ===== PROVIDER CONFIGURATION =====
+// Each provider has a name and a list of API base URLs.
+// You can add your own Tidal/Qobuz proxy URLs here or via environment variables.
+const PROVIDERS = {
+  monochrome: (process.env.MONOCHROME_API_BASES ||
+    "https://tracks.monochrome.st,https://api.monochrome.tf")
+    .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean),
+
+  tidal: (process.env.TIDAL_API_BASES || "")
+    .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean),
+
+  qobuz: (process.env.QOBUZ_API_BASES || "")
+    .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean)
+};
+
+// Flatten all providers into a single ordered list: Monochrome first, then Tidal, then Qobuz
+const ALL_BASES = [
+  ...PROVIDERS.monochrome.map(base => ({ base, provider: "monochrome" })),
+  ...PROVIDERS.tidal.map(base => ({ base, provider: "tidal" })),
+  ...PROVIDERS.qobuz.map(base => ({ base, provider: "qobuz" }))
+];
 
 const cache = new Map();
 const hits = new Map();
@@ -67,7 +86,7 @@ async function fetchJson(url) {
       signal: controller.signal,
       headers: {
         "accept": "application/json",
-        "user-agent": "DexAudioBridge/1.0 (+self-hosted BitChord addon)"
+        "user-agent": "DexAudioBridge/1.1 (+self-hosted BitChord addon)"
       }
     });
     if (!response.ok) throw new Error(`Upstream HTTP ${response.status}`);
@@ -76,113 +95,136 @@ async function fetchJson(url) {
     clearTimeout(timer);
   }
 }
+
+// Generic search against a base URL that follows the Monochrome-style contract.
+// If your Tidal/Qobuz proxy uses a different path or response shape, adjust here.
+async function searchOnBase(base, query, quality, provider) {
+  const endpoint = new URL(`${base}/search/tracks`);
+  endpoint.searchParams.set("q", query);
+  endpoint.searchParams.set("limit", "25");
+  const payload = await fetchJson(endpoint);
+  const rows = Array.isArray(payload) ? payload :
+    (payload.tracks || payload.data?.tracks || payload.results || []);
+  return rows.map(item => {
+    const id = String(item.id ?? item.trackId ?? item.tidalId ?? "");
+    const title = item.title ?? item.name;
+    if (!id || !title) return null;
+    const artist = typeof item.artist === "string" ? item.artist :
+      (item.artist?.name || item.artists?.map(a => a.name).filter(Boolean).join(", ") || "");
+    const album = typeof item.album === "string" ? item.album : (item.album?.title || item.album?.name || "");
+    const duration = Number(item.duration ?? item.durationSeconds ?? 0);
+    const artwork = item.artworkURL || item.cover || item.album?.cover ||
+      item.album?.image || item.image || "";
+    return {
+      id,
+      title: String(title),
+      artist: String(artist),
+      album: String(album),
+      duration: Number.isFinite(duration) ? duration : 0,
+      ...(artwork ? { artworkURL: String(artwork) } : {}),
+      format: quality === "LOW" || quality === "HIGH" ? "aac" : "flac",
+      audioQuality: quality,
+      source: provider // helps you see which provider returned the track
+    };
+  }).filter(Boolean).slice(0, 25);
+}
+
 async function upstreamSearch(query, quality) {
   const key = `search:${quality}:${query.toLowerCase()}`;
   const old = cached(key, 180000);
   if (old) return old;
 
-  let lastError;
-  for (const base of API_BASES) {
+  const collected = [];
+  const errors = [];
+
+  // Try every configured provider in order. Collect results from all that work.
+  for (const { base, provider } of ALL_BASES) {
     try {
-      // Monochrome's public catalogue API exposes /search/tracks.
-      const endpoint = new URL(`${base}/search/tracks`);
-      endpoint.searchParams.set("q", query);
-      endpoint.searchParams.set("limit", "25");
-      const payload = await fetchJson(endpoint);
-      const rows = Array.isArray(payload) ? payload :
-        (payload.tracks || payload.data?.tracks || payload.results || []);
-      const tracks = rows.map((item, index) => {
-        const id = String(item.id ?? item.trackId ?? item.tidalId ?? "");
-        const title = item.title ?? item.name;
-        if (!id || !title) return null;
-        const artist = typeof item.artist === "string" ? item.artist :
-          (item.artist?.name || item.artists?.map(a => a.name).filter(Boolean).join(", ") || "");
-        const album = typeof item.album === "string" ? item.album : (item.album?.title || item.album?.name || "");
-        const duration = Number(item.duration ?? item.durationSeconds ?? 0);
-        const artwork = item.artworkURL || item.cover || item.album?.cover ||
-          item.album?.image || item.image || "";
-        return {
-          id,
-          title: String(title),
-          artist: String(artist),
-          album: String(album),
-          duration: Number.isFinite(duration) ? duration : 0,
-          ...(artwork ? { artworkURL: String(artwork) } : {}),
-          format: quality === "LOW" || quality === "HIGH" ? "aac" : "flac",
-          audioQuality: quality
-        };
-      }).filter(Boolean).slice(0, 25);
-      putCache(key, tracks, 180000);
-      return tracks;
+      const tracks = await searchOnBase(base, query, quality, provider);
+      collected.push(...tracks);
+      if (collected.length >= 25) break; // stop early once we have enough
     } catch (error) {
-      lastError = error;
+      errors.push(`${provider}@${base}: ${error.message}`);
     }
   }
-  throw lastError || new Error("No catalogue API responded");
+
+  if (collected.length === 0) {
+    throw new Error(errors.length ? errors.join(" | ") : "No catalogue API responded");
+  }
+
+  const result = collected.slice(0, 25);
+  putCache(key, result, 180000);
+  return result;
 }
+
+async function resolveOnBase(base, id, quality, provider) {
+  const endpoint = new URL(`${base}/track/${encodeURIComponent(id)}`);
+  endpoint.searchParams.set("quality", quality);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "user-agent": "DexAudioBridge/1.1" }
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response.ok) throw new Error(`Upstream HTTP ${response.status}`);
+  const contentType = response.headers.get("content-type") || "";
+  let result;
+  if (contentType.includes("application/json")) {
+    const body = await response.json();
+    const url = body.url || body.streamUrl || body.audioUrl || body.data?.url;
+    if (!url) throw new Error("Upstream response did not contain a playable URL");
+    result = {
+      url,
+      format: body.format || "flac",
+      quality: body.quality || quality,
+      codec: body.codec || (quality === "LOW" || quality === "HIGH" ? "aac" : "flac"),
+      container: body.container || (quality === "LOW" || quality === "HIGH" ? "mp4" : "flac"),
+      manifest: body.manifest || "none",
+      encrypted: Boolean(body.encrypted),
+      ...(body.sampleRate ? { sampleRate: Number(body.sampleRate) } : {}),
+      ...(body.bitDepth ? { bitDepth: Number(body.bitDepth) } : {}),
+      ...(body.bitrate ? { bitrate: Number(body.bitrate) } : {}),
+      source: provider
+    };
+  } else {
+    result = {
+      url: endpoint.toString(),
+      format: "flac",
+      quality: quality === "LOSSLESS" ? "Lossless" : quality,
+      codec: "flac",
+      container: "flac",
+      manifest: "none",
+      encrypted: false,
+      source: provider
+    };
+  }
+  if (!/^https?:\/\//i.test(result.url)) throw new Error("Invalid upstream stream URL");
+  return result;
+}
+
 async function resolveTrack(id, quality) {
   const key = `stream:${quality}:${id}`;
   const old = cached(key, 45000);
   if (old) return old;
 
-  let lastError;
-  for (const base of API_BASES) {
+  const errors = [];
+  for (const { base, provider } of ALL_BASES) {
     try {
-      const endpoint = new URL(`${base}/track/${encodeURIComponent(id)}`);
-      endpoint.searchParams.set("quality", quality);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-      let response;
-      try {
-        response = await fetch(endpoint, {
-          method: "GET",
-          redirect: "follow",
-          signal: controller.signal,
-          headers: { "user-agent": "DexAudioBridge/1.0" }
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!response.ok) throw new Error(`Upstream HTTP ${response.status}`);
-      const contentType = response.headers.get("content-type") || "";
-      let result;
-      if (contentType.includes("application/json")) {
-        const body = await response.json();
-        const url = body.url || body.streamUrl || body.audioUrl || body.data?.url;
-        if (!url) throw new Error("Upstream response did not contain a playable URL");
-        result = {
-          url,
-          format: body.format || "flac",
-          quality: body.quality || quality,
-          codec: body.codec || (quality === "LOW" || quality === "HIGH" ? "aac" : "flac"),
-          container: body.container || (quality === "LOW" || quality === "HIGH" ? "mp4" : "flac"),
-          manifest: body.manifest || "none",
-          encrypted: Boolean(body.encrypted),
-          ...(body.sampleRate ? { sampleRate: Number(body.sampleRate) } : {}),
-          ...(body.bitDepth ? { bitDepth: Number(body.bitDepth) } : {}),
-          ...(body.bitrate ? { bitrate: Number(body.bitrate) } : {})
-        };
-      } else {
-        // A direct audio response is not exposed as a temporary proxy.
-        // The API route itself is returned as the stream URL.
-        result = {
-          url: endpoint.toString(),
-          format: "flac",
-          quality: quality === "LOSSLESS" ? "Lossless" : quality,
-          codec: "flac",
-          container: "flac",
-          manifest: "none",
-          encrypted: false
-        };
-      }
-      if (!/^https?:\/\//i.test(result.url)) throw new Error("Invalid upstream stream URL");
+      const result = await resolveOnBase(base, id, quality, provider);
       putCache(key, result, 45000);
       return result;
     } catch (error) {
-      lastError = error;
+      errors.push(`${provider}@${base}: ${error.message}`);
     }
   }
-  throw lastError || new Error("Track could not be resolved");
+  throw new Error(errors.length ? errors.join(" | ") : "Track could not be resolved");
 }
 
 const manifest = {
@@ -232,7 +274,11 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/health") {
     return json(res, 200, {
       ok: true, id: ADDON_ID, name: NAME, version: VERSION,
-      providers: API_BASES.map(base => ({ base, configured: true }))
+      providers: Object.entries(PROVIDERS).map(([name, bases]) => ({
+        name,
+        configured: bases.length > 0,
+        bases
+      }))
     });
   }
   if (limited(req, res)) return;
@@ -265,4 +311,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`${NAME} v${VERSION} listening on http://${HOST}:${PORT}`);
+  console.log("Configured providers:");
+  for (const [name, bases] of Object.entries(PROVIDERS)) {
+    console.log(`  ${name}: ${bases.length ? bases.join(", ") : "(not configured)"}`);
+  }
 });
