@@ -4,8 +4,12 @@
   "private": true,
   "type": "module",
   "description": "An independently implemented BitChord music source addon by Dex.",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "check": "node --check src/server.js"
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
