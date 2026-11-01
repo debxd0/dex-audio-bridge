@@ -2,7 +2,7 @@
 
 An independently implemented BitChord music-source addon. It has its own addon identity, server code, request handling, cache, rate limit, health endpoint and setup documentation.
 
-# 🚨 PROJECT DISCONTINUED & FAILED 🚨
+# 🚨 PROJECT DISCONTINUED 🚨
 
 ### ⚠️ THIS PROJECT IS NO LONGER UNDER MAINTENANCE. IT IS A FAILED PROJECT. ⚠️
 **DO NOT DEPLOY THIS. IT DOES NOT WORK AS INTENDED AND WILL FAIL TO PLAY LOSSLESS AUDIO IN BITCHORD.**
